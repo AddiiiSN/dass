@@ -12,62 +12,32 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from tensorflow.keras.models import load_model
 import threading
 import asyncio
-import mysql.connector
+import torch
+from transformers import BertTokenizer, BertForSequenceClassification
+
+# ===================[ KONFIGURASI LOGGING ]===================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# ===================[ SETUP MODEL BERT ]===================
+MODEL_NAME = "bert-base-uncased"
+tokenizer = BertTokenizer.from_pretrained(MODEL_NAME)
+model = BertForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=4)
+
+def predict_dass21_score(answer):
+    inputs = tokenizer(answer, return_tensors="pt", padding=True, truncation=True, max_length=128)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    return torch.argmax(outputs.logits, dim=1).item()# Pilih skor tertinggi (0,1,2,3)
+    return predicted_score
+
+# ===================[ LOAD MODEL CHATBOT ]===================
+nltk.download("punkt")
+nltk.download("wordnet")
 
 
-nltk.download('wordnet')
-nltk.download('omw-1.4')
-
-# ===================[ Konfigurasi Database ]===================
-DB_CONFIG = {
-    "host": "localhost",
-    "user": "root",  # Ganti dengan username database Anda
-    "password": "",  # Ganti dengan password database Anda
-    "database": "carebot_db",  # Ganti dengan nama database Anda
-}
-
-
-def connect_db():
-    """Membuka koneksi ke database."""
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        return conn
-    except mysql.connector.Error as err:
-        print(f"Error: {err}")
-        return None
-
-
-def save_dass_result(user_id, depression, anxiety, stress):
-    """Menyimpan hasil skrining DASS-21 ke database."""
-    conn = connect_db()
-    if conn:
-        cursor = conn.cursor()
-        query = """
-        INSERT INTO dass_results (user_id, depression, anxiety, stress, created_at)
-        VALUES (%s, %s, %s, %s, NOW())
-        """
-        cursor.execute(query, (user_id, depression, anxiety, stress))
-        conn.commit()
-        cursor.close()
-        conn.close()
-
-
-def log_chat(user_id, user_message, bot_response):
-    """Menyimpan log percakapan chatbot ke database."""
-    conn = connect_db()
-    if conn:
-        cursor = conn.cursor()
-        query = """
-        INSERT INTO chat_logs (user_id, user_message, bot_response, timestamp)
-        VALUES (%s, %s, %s, NOW())
-        """
-        cursor.execute(query, (user_id, user_message, bot_response))
-        conn.commit()
-        cursor.close()
-        conn.close()
-
-# ===================[ Konfigurasi Logging ]===================
-logging.basicConfig(level=logging.INFO)
 
 # ===================[ Load Model Chatbot (Neural Network) ]===================
 nltk.download('punkt')
@@ -87,21 +57,26 @@ with open("label_encoder.pkl", "rb") as file:
 model = load_model("chatbot_model.keras")
 
 def predict_class(text):
-    """Memprediksi kelas teks pengguna dengan Neural Network"""
-    words = nltk.word_tokenize(text)
+    """Memprediksi intent dari input pengguna tanpa mencampur terlalu banyak riwayat"""
+
+    words = nltk.word_tokenize(text)  # Gunakan hanya input terbaru
     processed_text = " ".join([lemmatizer.lemmatize(w.lower()) for w in words])
 
     X_input = vectorizer.transform([processed_text]).toarray()
     prediction = model.predict(X_input)
     predicted_class = np.argmax(prediction)
-    
+
     tag = label_encoder.inverse_transform([predicted_class])[0]
 
+    # Cari respons yang sesuai dari intents JSON
     for intent in intents["intents"]:
         if intent["tag"] == tag:
             return random.choice(intent["responses"])
-    
+
     return "Maaf, saya tidak mengerti. Bisa Anda jelaskan lebih lanjut?"
+
+   
+
 
 # ===================[ Mapping Keyword ke Skor Skrining ]===================
 keywords = {
@@ -191,7 +166,7 @@ async def handle_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if user_choice == "CareBot":
         context.user_data["in_dass"] = False
-        await update.message.reply_text("Anda memilih CareBot. Silakan kirim pertanyaan Anda.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("Anda memilih CareBot. ada yang bisa saya bantu ,Silakan kirim pertanyaan Anda.", reply_markup=ReplyKeyboardRemove())
 
     elif user_choice == "Skrining DASS-21":
         context.user_data["in_dass"] = True
@@ -204,16 +179,37 @@ async def start_dass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ask_dass_question(update, context)
 
 async def ask_dass_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menampilkan pertanyaan DASS-21"""
+    """Menampilkan pertanyaan DASS-21 satu per satu"""
+
     user_id = update.effective_user.id
     session = user_sessions.get(user_id)
 
     if not session or session["current_question"] >= len(dass_questions):
+        # **Pastikan skrining selesai dengan memanggil conclude_dass()**
         await conclude_dass(update, context)
-        return
+        return  
 
+    # **Tampilkan pertanyaan berikutnya**
     question_data = dass_questions[session["current_question"]]
     await update.message.reply_text(question_data["question"])
+
+# ========================
+# 5. Prediksi Skor dengan BERT (Dikali 2)
+# ========================
+if 'user_answers' not in globals() or 'questions' not in globals():
+    user_answers = []  # Jika tidak ada jawaban, inisialisasi list kosong
+    questions = []
+
+dass_scores = [predict_dass21_score(answer) * 2 for answer in user_answers]
+
+# ========================
+# 6. Menampilkan Hasil Skrining
+# ========================
+print("\n=== Hasil Skrining DASS-21 ===")
+for i, (question, answer, score) in enumerate(zip(questions, user_answers, dass_scores)):
+    print(f"\nQ{i+1}: {question}")
+    print(f"User: {answer}")
+    print(f"Predicted Score (x2): {score}")  # Pastikan skor sudah dikali 2
 
 async def handle_dass_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menangani jawaban pengguna dalam skrining"""
@@ -221,11 +217,21 @@ async def handle_dass_response(update: Update, context: ContextTypes.DEFAULT_TYP
     session = user_sessions.get(user_id)
 
     if session:
+        # Cek apakah masih ada pertanyaan tersisa
+        if session["current_question"] >= len(dass_questions):
+            await conclude_dass(update, context)
+            return
+
         question = dass_questions[session["current_question"]]
-        score = analyze_response(update.message.text, question["question"]) * 2
+        score = analyze_response(update.message.text, question["question"]) * 2  # Pastikan skor dikali 2
         session["scores"][question["scale"]] += score
         session["current_question"] += 1
-        await ask_dass_question(update, context)
+
+        # Tampilkan pertanyaan berikutnya atau akhiri skrining
+        if session["current_question"] < len(dass_questions):
+            await ask_dass_question(update, context)
+        else:
+            await conclude_dass(update, context)  # Skrining selesai
 
 async def conclude_dass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menampilkan hasil akhir skrining dengan penjelasan yang sesuai, lalu kembali ke menu utama."""
@@ -257,15 +263,42 @@ async def conclude_dass(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+     # **Pastikan status skrining dimatikan**
+    context.user_data["in_dass"] = False
+
+
     await start(update, context)  # Kembali ke menu utama
 
 async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menangani chat dengan CareBot jika tidak dalam sesi skrining"""
+    """Menangani chat dengan CareBot atau skrining DASS-21"""
+
+    user_id = update.effective_user.id
+    user_message = update.message.text.strip()
+
+    # **Jika pengguna sedang dalam sesi skrining, paksa ke handler skrining**
     if context.user_data.get("in_dass", False):
         await handle_dass_response(update, context)
-    else:
-        response = predict_class(update.message.text)
-        await update.message.reply_text(response)
+        return  # Pastikan CareBot tidak menangani pesan ini!
+
+    # **Jika tidak dalam skrining, lanjutkan ke CareBot seperti biasa**
+    history = context.user_data.get("chat_history", [])
+    history.append({"role": "user", "text": user_message})
+
+    response = predict_class(user_message)  # Prediksi jawaban berdasarkan input pengguna saja
+
+    history.append({"role": "bot", "text": response})
+
+    if len(history) > 10:
+        history = history[-10:]
+
+    context.user_data["chat_history"] = history  
+
+    await update.message.reply_text(response)
+
+async def reset_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menghapus riwayat percakapan dan memulai dari awal"""
+    context.user_data["chat_history"] = []
+    await update.message.reply_text("Riwayat percakapan telah dihapus. Silakan mulai percakapan baru.")
 
 
 # ===================[ Konfigurasi Bot Telegram ]===================
@@ -282,9 +315,13 @@ application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.Regex("^(CareBot|Skrining DASS-21)$"), handle_menu_choice))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat))
 
+application.add_handler(CommandHandler("reset", reset_chat))
+
 # Jalankan bot
 def run_bot():
     application.run_polling()
 
 if __name__ == "__main__":
     application.run_polling()
+
+
